@@ -84,3 +84,7 @@ explain select sum(id) from t1;
 
 See [this post](https://www.percona.com/blog/2018/11/19/installing-and-configuring-jit-in-postgresql-11/)
 
+Disable multi-threading:
+```bash
+SET max_parallel_workers_per_gather = 0;
+```
