@@ -55,8 +55,10 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <stdio.h>
 
 #include "access/transam.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -73,6 +75,17 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/plantree_traverse.h"
+#include "optimizer/planmain.h"
+#include "optimizer/paths.h"
+#include "rewrite/rewriteManip.h"
+#include "nodes/makefuncs.h"
+#include "access/table.h"
+#include "access/genam.h"
+#include "access/amapi.h"
+#include "catalog/pg_opfamily.h"
+#include "catalog/pg_am.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -114,6 +127,548 @@ static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue);
 static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
+static SeqScan *make_seqscan(List *qptlist, List *qpqual, Index scanrelid);
+static SampleScan *make_samplescan(List *qptlist, List *qpqual, Index scanrelid,
+								   TableSampleClause *tsc);
+static IndexScan *make_indexscan(List *qptlist, List *qpqual, Index scanrelid,
+								 Oid indexid, List *indexqual, List *indexqualorig,
+								 List *indexorderby, List *indexorderbyorig,
+								 List *indexorderbyops,
+								 ScanDirection indexscandir);
+static IndexOnlyScan *
+make_indexonlyscan(List *qptlist,
+				   List *qpqual,
+				   Index scanrelid,
+				   Oid indexid,
+				   List *indexqual,
+				   List *recheckqual,
+				   List *indexorderby,
+				   List *indextlist,
+				   ScanDirection indexscandir);
+
+static List *fix_indexquals_local(IndexOptInfo *index,
+	List *quals, Oid tablerelid, List *matchColnos);
+
+static void switch_running_time(CachedPlanSource *plansource);
+static double get_mean_cost(CachedPlanSource *plansource, bool isMain);
+static void set_running_cost(CachedPlanSource *plansource, bool isMain);
+static void switch_plan_tree(PlannedStmt* stmt, CachedPlanSource *plansource);
+
+static Node *
+fix_indexqual_operand_local(Node *node, IndexOptInfo *index, int indexcol, Index tablerelid)
+{
+	Var		   *result;
+	int			pos;
+	ListCell   *indexpr_item;
+
+	/*
+	 * Remove any binary-compatible relabeling of the indexkey
+	 */
+	if (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+
+	Assert(indexcol >= 0 && indexcol < index->ncolumns);
+
+	if (index->indexkeys[indexcol] != 0)
+	{
+		/* It's a simple index column */
+		if (IsA(node, Var) &&
+			((Var *) node)->varno == tablerelid &&
+			((Var *) node)->varattno == index->indexkeys[indexcol])
+		{
+			result = (Var *) copyObject(node);
+			result->varno = INDEX_VAR;
+			result->varattno = indexcol + 1;
+			return (Node *) result;
+		}
+		else {
+			elog(ERROR, "index key does not match expected index column");
+		}
+	}
+
+	/* It's an index expression, so find and cross-check the expression */
+	indexpr_item = list_head(index->indexprs);
+	for (pos = 0; pos < index->ncolumns; pos++)
+	{
+		if (index->indexkeys[pos] == 0)
+		{
+			if (indexpr_item == NULL)
+				elog(ERROR, "too few entries in indexprs list");
+			if (pos == indexcol)
+			{
+				Node	   *indexkey;
+
+				indexkey = (Node *) lfirst(indexpr_item);
+				if (indexkey && IsA(indexkey, RelabelType))
+					indexkey = (Node *) ((RelabelType *) indexkey)->arg;
+				if (equal(node, indexkey))
+				{
+					result = makeVar(INDEX_VAR, indexcol + 1,
+									 exprType(lfirst(indexpr_item)), -1,
+									 exprCollation(lfirst(indexpr_item)),
+									 0);
+
+					return (Node *) result;
+				}
+				else {
+					elog(ERROR, "index key does not match expected index column");
+				}
+			}
+			indexpr_item = lnext(index->indexprs, indexpr_item);
+		}
+	}
+
+	/* Oops... */
+	elog(ERROR, "index key does not match expected index column");
+	return NULL;				/* keep compiler quiet */
+}
+
+
+static Node *
+fix_indexqual_clause_local(IndexOptInfo *index, int indexcol,
+					 Node *clause, List *indexcolnos, Index tablerelid)
+{
+	/*
+	 * Replace any outer-relation variables with nestloop params.
+	 *
+	 * This also makes a copy of the clause, so it's safe to modify it
+	 * in-place below.
+	 */
+
+	// printf("createplan.c: fix_indexqual_clause_local, table id %d\n", (int)tablerelid);
+
+	if (IsA(clause, OpExpr))
+	{
+		clause = (Node *)(copyObject((OpExpr *) clause));
+		OpExpr	   *op = (OpExpr *) clause;
+
+		/* Replace the indexkey expression with an index Var. */
+		linitial(op->args) = fix_indexqual_operand_local(linitial(op->args),
+												   index,
+												   indexcol,
+												   tablerelid);
+	}
+	else if (IsA(clause, RowCompareExpr))
+	{
+		clause = (Node *)(copyObject((RowCompareExpr *) clause));
+		RowCompareExpr *rc = (RowCompareExpr *) clause;
+		ListCell   *lca,
+				   *lcai;
+
+		/* Replace the indexkey expressions with index Vars. */
+		Assert(list_length(rc->largs) == list_length(indexcolnos));
+		forboth(lca, rc->largs, lcai, indexcolnos)
+		{
+			lfirst(lca) = fix_indexqual_operand_local(lfirst(lca),
+												index,
+												lfirst_int(lcai),
+												tablerelid);
+		}
+	}
+	else if (IsA(clause, ScalarArrayOpExpr))
+	{
+		clause = (Node *)(copyObject((ScalarArrayOpExpr *) clause));
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+		/* Replace the indexkey expression with an index Var. */
+		linitial(saop->args) = fix_indexqual_operand_local(linitial(saop->args),
+													 index,
+													 indexcol,
+													 tablerelid);
+	}
+	else if (IsA(clause, NullTest))
+	{
+		clause = (Node *)(copyObject((NullTest *) clause));
+		NullTest   *nt = (NullTest *) clause;
+
+		/* Replace the indexkey expression with an index Var. */
+		nt->arg = (Expr *) fix_indexqual_operand_local((Node *) nt->arg,
+												 index,
+												 indexcol,
+												 tablerelid);
+	}
+	else {
+		elog(ERROR, "unsupported indexqual type: %d",
+			 (int) nodeTag(clause));
+		// printf("createplan.c: fix_indexqual_clause_local, error\n");
+	}
+
+			 
+	// printf("createplan.c: fix_indexqual_clause_local, finish\n");
+	return clause;
+}
+
+static List *fix_indexquals_local(IndexOptInfo *index,
+	List *quals, Index tablerelid, List *matchColnos) {
+	List *fix_quals = NIL;
+	int indexcol;
+	List *indexcolnos;
+	ListCell *lc, *lcCol;
+
+	forboth(lc, quals, lcCol, matchColnos) {
+		Node *clause = lfirst_node(Node, lc);
+		indexcol = lfirst_int(lcCol);
+		indexcolnos = list_make1(indexcol);
+		fix_quals = lappend(fix_quals, fix_indexqual_clause_local(index,
+			indexcol, clause, indexcolnos, tablerelid));
+	}
+
+	return fix_quals;
+}
+
+#define IndexCollMatchesExprColl(idxcollation, exprcollation) \
+	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
+
+static int clause_matches_index(Node *clause, IndexOptInfo *info) {
+	int idx;
+	Oid	opfamily;
+	Oid	expr_op;
+	Oid	expr_coll;
+	Oid idxcollation;
+
+	if (IsA(clause, OpExpr)) {
+		OpExpr *op = (OpExpr *)clause;
+		// printf("plancache.c: clause_matches_index, op len %d\n", list_length(op->args));
+		if (list_length(op->args) == 2) {
+			Node *leftop = (Node *) linitial(op->args);
+			Node *rightop = (Node *) lsecond(op->args);
+			Oid	comm_op;
+			expr_coll = op->inputcollid;
+			expr_op = op->opno;
+			for (idx = 0; idx < info->nkeycolumns; idx++) {
+				opfamily = info->opfamily[idx];
+				idxcollation = info->indexcollations[idx];
+				// printf("plancache.c: clause_matches_index, %d %d %d %d\n", idxcollation, expr_coll, expr_op, opfamily);
+				if (match_index_to_operand(leftop, idx, info) && !contain_volatile_functions(rightop)
+					&& IndexCollMatchesExprColl(idxcollation, expr_coll) && op_in_opfamily(expr_op, opfamily)) {
+					return idx;
+				}
+				comm_op = get_commutator(expr_op);
+				if (match_index_to_operand(rightop, idx, info) && !contain_volatile_functions(leftop)
+					&& IndexCollMatchesExprColl(idxcollation, expr_coll) && OidIsValid(comm_op)
+					&& op_in_opfamily(comm_op, opfamily)) {
+					return idx;
+				}
+			}
+		}
+	} else if (IsA(clause, RowCompareExpr)) {
+		// printf("plancache.c: clause_matches_index, row compare\n");
+		if (info->relam == BTREE_AM_OID) {
+			RowCompareExpr *rc = (RowCompareExpr *)clause;
+			Node *leftop = (Node *) linitial(rc->largs);
+			Node *rightop = (Node *) linitial(rc->rargs);
+			expr_op = linitial_oid(rc->opnos);
+			expr_coll = linitial_oid(rc->inputcollids);
+			for (idx = 0; idx < info->nkeycolumns; idx++) {
+				bool exprMatch = false;
+				opfamily = info->opfamily[idx];
+				idxcollation = info->indexcollations[idx];
+				// printf("plancache.c: clause_matches_index, %d %d %d %d\n", idxcollation, expr_coll, expr_op, opfamily);
+
+				if (match_index_to_operand(leftop, idx, info) && !contain_volatile_functions(rightop)
+					&& IndexCollMatchesExprColl(idxcollation, expr_coll)) {
+					exprMatch = true;
+				} else {
+					expr_op = get_commutator(expr_op);
+					if (match_index_to_operand(rightop, idx, info) && !contain_volatile_functions(leftop)
+						&& IndexCollMatchesExprColl(idxcollation, expr_coll)) {
+						exprMatch = true;
+					}
+				}
+
+				if (exprMatch && OidIsValid(expr_op)) {
+					switch (get_op_opfamily_strategy(expr_op, opfamily))
+					{
+						case BTLessStrategyNumber:
+						case BTLessEqualStrategyNumber:
+						case BTGreaterEqualStrategyNumber:
+						case BTGreaterStrategyNumber:
+							return idx;
+							break;
+					}
+				}
+			}
+		}
+
+	} else if (IsA(clause, ScalarArrayOpExpr)) {
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+		if (saop->useOr) {
+			Node *leftop = (Node *) linitial(saop->args);
+			Node *rightop = (Node *) lsecond(saop->args);
+			expr_op = saop->opno;
+			expr_coll = saop->inputcollid;
+
+			for (idx = 0; idx < info->nkeycolumns; idx++) {
+				opfamily = info->opfamily[idx];
+				idxcollation = info->indexcollations[idx];
+				if (match_index_to_operand(leftop, idx, info) && !contain_volatile_functions(rightop)
+					&& IndexCollMatchesExprColl(idxcollation, expr_coll) && op_in_opfamily(expr_op, opfamily)) {
+					return idx;
+				}
+			}
+		}
+
+	} else if (info->amsearchnulls && IsA(clause, NullTest)) {
+		NullTest   *nt = (NullTest *) clause;
+		for (idx = 0; idx < info->nkeycolumns; idx++) {
+			if (!nt->argisrow &&
+				match_index_to_operand((Node *) nt->arg, idx, info)) {
+				return idx;
+			}
+		}
+	}
+
+	return -1;
+}
+
+static Plan *create_index_trigger(Plan *node, List *params, PlannedStmt* stmt) {
+	if (nodeTag(node) != T_SeqScan) {
+		return node;
+	}
+	// printf("Create index trigger called\n");
+	Scan *scannode = (Scan *)node;
+	IndexOptInfo *index = lfirst_node(IndexOptInfo, list_nth_cell(params, 0));
+	Oid reloid = list_nth_cell(params, 1)->oid_value;
+	List *relOidList = lfirst_node(List, list_nth_cell(params, 2));
+
+	if (reloid != list_nth_cell(relOidList, scannode->scanrelid - 1)->oid_value) {
+		// printf("plancache.c: relation not match, %d, %d\n", reloid, list_nth_cell(relOidList, scannode->scanrelid)->oid_value);
+		return node;
+	}
+
+	index->rel->relid = scannode->scanrelid;
+	if (nodeTag(node) == T_SeqScan) {
+		SeqScan *seqPlanNode = (SeqScan *)(node);
+		IndexScan *indexPlanNode;
+		Oid indexoid = index->indexoid;
+		// printf("Table Oid: %d Index Oid: %d\n", (int)reloid, (int)indexoid);
+
+		// printf("plancache.c: Replacing SeqScan\n");
+		// replace the plan info.
+
+		// separate index qual and other qual.
+		List *indexquals = NIL;
+		List *seqquals = NIL;
+		List *indexcolnos = NIL;
+		ListCell *quallc;
+		foreach(quallc, seqPlanNode->plan.qual) {
+			Node *clause = lfirst_node(Node, quallc);
+			int matchColno = clause_matches_index(clause, index);
+			if (matchColno >= 0) {
+				int innerIdx = 0;
+				while (innerIdx < list_length(indexcolnos)) {
+					if (list_nth_int(indexcolnos, innerIdx) > matchColno) {
+						break;
+					}
+					innerIdx++;
+				}
+				indexquals = list_insert_nth(indexquals, innerIdx, clause);
+				indexcolnos = list_insert_nth_int(indexcolnos, innerIdx, matchColno);
+				// printf("plancache.c: Add index qual\n");
+			} else {
+				seqquals = lappend(seqquals, clause);
+				// printf("plancache.c: Add seq qual\n");
+			}
+		}
+
+		if (indexquals == NIL) {
+			// printf("plancache.c: Not a match for index columns\n");
+			return node;
+		}
+
+		indexPlanNode = (Plan *)make_indexscan(
+			seqPlanNode->plan.targetlist,
+			seqquals,
+			seqPlanNode->scanrelid,
+			indexoid,
+			fix_indexquals_local(index,
+				indexquals,
+				seqPlanNode->scanrelid,
+				indexcolnos),
+			indexquals,
+			NIL, NIL, NIL, 0
+		);
+		// printf("plancache.c: Replaced to IndexScan\n");
+
+		// add seqscan to backup node.
+		indexPlanNode->scan.plan.backupNode = seqPlanNode;
+
+		stmt->has_index = true;
+
+		return indexPlanNode;
+	}
+}
+
+static Plan *create_index_sort_replacement(Plan *node, List *params, PlannedStmt *stmt) {
+	if (node->type != T_Sort) {
+		return node;
+	}
+	Sort* sortNode = (Sort*) node;
+	Scan* scanNode = (Scan*) node->lefttree;
+
+	if (nodeTag(scanNode) != T_SeqScan) {
+		return node;
+	}
+
+	SeqScan *seqPlanNode = (SeqScan *)(scanNode);
+	IndexOptInfo *info = lfirst_node(IndexOptInfo, list_nth_cell(params, 0));
+	Oid reloid = list_nth_cell(params, 1)->oid_value;
+	List *relOidList = lfirst_node(List, list_nth_cell(params, 2));
+
+	if (info->relam != BTREE_AM_OID) {
+		return node;
+	}
+
+	if (reloid != list_nth_cell(relOidList, scanNode->scanrelid - 1)->oid_value) {
+		return node;
+	}
+
+	// printf("plancache.c: Start sort+seq -> index\n");
+
+	// Check if all attributes for sort exist in the index column
+	bool allExist = true;
+	int i = 0;
+	int j = 0;
+	for (i = 0; i < sortNode->numCols; i++) {
+		bool attrFound = false;
+		for (j = 0; j < info->nkeycolumns; j++) {
+			if ((int)sortNode->sortColIdx[i] == (int)info->indexkeys[j]) {
+				attrFound = true;
+				break;
+			}
+		}
+		if (!attrFound) {
+			allExist = false;
+			break;
+		}
+	}
+
+	// printf("plancache.c: All attributes in index columns? %d\n", allExist);
+
+	if (allExist) {
+		// Check order
+		int numOfIncreasingOids = 51;
+		int increasingOrderOids[] = {37, 58, 95, 97, 255, 261, 5073, 2799, 412, 418, 534, 535, 609, 645, 622, 631,
+		660, 664, 672, 1095, 1552, 1122, 1132, 1322, 1332, 1502, 1587, 1222, 3364, 1203, 1754, 1786, 1806, 1864,
+		1957, 2062, 2345, 2358, 2371, 2384, 2534, 2540, 2974, 3224, 3518, 3627, 3674, 2990, 3884, 3242, 2862};
+
+		int i = 0;
+		bool increasing = false;
+		for (i = 0; i < numOfIncreasingOids; i++) {
+			if (sortNode->sortOperators[0] == increasingOrderOids[i]) {
+				increasing = true;
+				break;
+			}
+		}
+		// printf("plancache.c: Sort order increasing? %d\n", increasing);
+		info->rel->relid = scanNode->scanrelid;
+		List *indexquals = NIL;
+		List *seqquals = NIL;
+		List *indexcolnos = NIL;
+		ListCell *quallc;
+		foreach(quallc, seqPlanNode->plan.qual) {
+			Node *clause = lfirst_node(Node, quallc);
+			int matchColno = clause_matches_index(clause, info);
+			if (matchColno >= 0) {
+				int innerIdx = 0;
+				while (innerIdx < list_length(indexcolnos)) {
+					if (list_nth_int(indexcolnos, innerIdx) > matchColno) {
+						break;
+					}
+					innerIdx++;
+				}
+				indexquals = list_insert_nth(indexquals, innerIdx, clause);
+				indexcolnos = list_insert_nth_int(indexcolnos, innerIdx, matchColno);
+				// printf("plancache.c: Add index qual\n");
+			} else {
+				seqquals = lappend(seqquals, clause);
+				// printf("plancache.c: Add seq qual\n");
+			}
+		}
+
+		if (indexquals == NIL) {
+			return node;
+		}
+
+		Oid indexoid = info->indexoid;
+
+		Plan* newNode = (Plan *)make_indexscan(
+			seqPlanNode->plan.targetlist,
+			seqquals,
+			seqPlanNode->scanrelid,
+			indexoid,
+			fix_indexquals_local(info,
+				indexquals,
+				seqPlanNode->scanrelid,
+				indexcolnos),
+			indexquals,
+			NIL, NIL, NIL, increasing ? 0 : -1
+		);
+		newNode->backupNode = node;
+		stmt->has_index = true;
+		// printf("plancache.c: sort+seq->index finishes\n");
+		return newNode;
+	}
+
+	return node;
+}
+
+static void recursive_delete(Plan* node) {
+	if (node->lefttree != NULL) {
+		recursive_delete(node->lefttree);
+	}
+	if (node->righttree != NULL) {
+		recursive_delete(node->righttree);
+	}
+	pfree(node);
+}
+
+static Plan *drop_index_trigger(Plan *node, List *params, PlannedStmt *stmt) {
+	Oid indexoid = list_nth_cell(params, 0)->oid_value;
+	if (nodeTag(node) != T_IndexScan
+		&& (node->backupNode == NULL || nodeTag(node->backupNode) != T_IndexScan)) {
+		return node;
+	}
+
+	Plan *savedNode = node;
+	Plan *anotherNode = node->backupNode;
+	if (nodeTag(node) != T_IndexScan) {
+		node = node->backupNode;
+		anotherNode = savedNode;
+	}
+
+	IndexScan *indexPlanNode = (IndexScan *)node;
+	if (indexPlanNode->indexid != indexoid) {
+		return savedNode;
+	}
+
+	stmt->has_index = false;
+
+	if (anotherNode != NULL) {
+		// printf("Drop index trigger: not null\n");
+		// fflush(stdout);
+		Plan* originalNode = anotherNode;
+		recursive_delete(node);
+		return originalNode;
+	} else {
+		// printf("This branch should be NEVER CALLED!!!!!\n\n\n");
+		List *quals = NIL;
+		ListCell *lc;
+		foreach(lc, indexPlanNode->indexqualorig) {
+			quals = lappend(quals, lc);
+		}
+		foreach(lc, indexPlanNode->scan.plan.qual) {
+			quals = lappend(quals, lc);
+		}
+
+		SeqScan *seqPlanNode = make_seqscan(indexPlanNode->scan.plan.targetlist,
+			quals, indexPlanNode->scan.scanrelid);
+
+		recursive_delete(node);
+		return seqPlanNode;
+	}
+}
 
 /* GUC parameter */
 int			plan_cache_mode;
@@ -126,7 +681,7 @@ int			plan_cache_mode;
 void
 InitPlanCache(void)
 {
-	CacheRegisterRelcacheCallback(PlanCacheRelCallback, (Datum) 0);
+	CacheRegisterRelcacheCallback(PlanCacheRelCallback, (Datum) palloc(sizeof(AdaptiveIndexMsg)));
 	CacheRegisterSyscacheCallback(PROCOID, PlanCacheObjectCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(TYPEOID, PlanCacheObjectCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(NAMESPACEOID, PlanCacheSysCallback, (Datum) 0);
@@ -165,6 +720,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 				 const char *query_string,
 				 CommandTag commandTag)
 {
+	// printf("plancache.c: CreateCachedPlan() begin\n");
 	CachedPlanSource *plansource;
 	MemoryContext source_context;
 	MemoryContext oldcxt;
@@ -222,7 +778,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->num_custom_plans = 0;
 
 	MemoryContextSwitchTo(oldcxt);
-
+	// printf("plancache.c: CreateCachedPlan() end\n");
 	return plansource;
 }
 
@@ -249,6 +805,7 @@ CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 						const char *query_string,
 						CommandTag commandTag)
 {
+	// printf("plancache.c: CreateOneShotCachedPlan() begin\n");
 	CachedPlanSource *plansource;
 
 	Assert(query_string != NULL);	/* required as of 8.4 */
@@ -345,6 +902,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 				   int cursor_options,
 				   bool fixed_result)
 {
+	// printf("plancache.c: CompleteCachedPlan() begin\n");
 	MemoryContext source_context = plansource->context;
 	MemoryContext oldcxt = CurrentMemoryContext;
 
@@ -433,6 +991,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 
 	plansource->is_complete = true;
 	plansource->is_valid = true;
+	// printf("plancache.c: CompleteCachedPlan() end\n");
 }
 
 /*
@@ -453,6 +1012,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 void
 SaveCachedPlan(CachedPlanSource *plansource)
 {
+	// printf("plancache.c: SaveCachedPlan() begin\n");
 	/* Assert caller is doing things in a sane order */
 	Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
 	Assert(plansource->is_complete);
@@ -484,6 +1044,7 @@ SaveCachedPlan(CachedPlanSource *plansource)
 	dlist_push_tail(&saved_plan_list, &plansource->node);
 
 	plansource->is_saved = true;
+	// printf("plancache.c: SaveCachedPlan() end\n");
 }
 
 /*
@@ -497,6 +1058,7 @@ SaveCachedPlan(CachedPlanSource *plansource)
 void
 DropCachedPlan(CachedPlanSource *plansource)
 {
+	// printf("plancache.c: DropCachedPlan() begin\n");
 	Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
 
 	/* If it's been saved, remove it from the list */
@@ -555,6 +1117,7 @@ static List *
 RevalidateCachedQuery(CachedPlanSource *plansource,
 					  QueryEnvironment *queryEnv)
 {
+	// printf("plancache.c: Revalidate() begin\n");
 	bool		snapshot_set;
 	RawStmt    *rawtree;
 	List	   *tlist;			/* transient query-tree list */
@@ -625,6 +1188,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		AcquirePlannerLocks(plansource->query_list, false);
 	}
 
+	// printf("plancache.c: Revalidate() re-compile!!!\n");
 	/*
 	 * Discard the no-longer-useful query tree.  (Note: we don't want to do
 	 * this any earlier, else we'd not have been able to release locks
@@ -794,6 +1358,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 static bool
 CheckCachedPlan(CachedPlanSource *plansource)
 {
+	// printf("plancache.c: CheckCachedPlan() begin\n");
 	CachedPlan *plan = plansource->gplan;
 
 	/* Assert that caller checked the querytree */
@@ -855,8 +1420,34 @@ CheckCachedPlan(CachedPlanSource *plansource)
 	 * Plan has been invalidated, so unlink it from the parent and release it.
 	 */
 	ReleaseGenericPlan(plansource);
-
+	// printf("plancache.c: CheckCachedPlan() not valid!\n");
 	return false;
+}
+
+static void PrintTree(Plan* root) {
+	if (root != NULL) {
+		// printf("Type of node: %d\n", nodeTag(root));
+		if (root->lefttree) {
+			// printf("Left tree:\n");
+			PrintTree(root->lefttree);
+		}
+		if (root->righttree) {
+			// printf("Right tree:\n");
+			PrintTree(root->righttree);
+		}
+	}
+}
+
+static void SetBackNodeToNull(Plan* root) {
+	if (root != NULL) {
+		root->backupNode = NULL;
+		if (root->lefttree) {
+			SetBackNodeToNull(root->lefttree);
+		}
+		if (root->righttree) {
+			SetBackNodeToNull(root->righttree);
+		}
+	}
 }
 
 /*
@@ -879,6 +1470,8 @@ static CachedPlan *
 BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 				ParamListInfo boundParams, QueryEnvironment *queryEnv)
 {
+	TimestampTz start = GetCurrentTimestamp();
+	// printf("plancache.c: BuildCachedPlan\n");
 	CachedPlan *plan;
 	List	   *plist;
 	bool		snapshot_set;
@@ -935,6 +1528,17 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	plist = pg_plan_queries(qlist, plansource->query_string,
 							plansource->cursor_options, boundParams);
 
+	ListCell* l;
+	foreach(l, plist) {
+		PlannedStmt* stmt = lfirst_node(PlannedStmt, l);
+		// printf("plancache.c: The type of the node is: %d\n", nodeTag(stmt));
+		// printf("plancache.c: Set has_index to false\n");
+		stmt->has_index = false;
+		stmt->state = 0;
+		Plan* planTree = stmt->planTree;
+		PrintTree(planTree);
+		SetBackNodeToNull(planTree);
+	}
 	/* Release snapshot if we got one */
 	if (snapshot_set)
 		PopActiveSnapshot();
@@ -1007,6 +1611,8 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 
 	MemoryContextSwitchTo(oldcxt);
 
+	TimestampTz end = GetCurrentTimestamp();
+	printf("%s:Build:%ld:%ld\n", plansource->stmt_name, end - start, start);
 	return plan;
 }
 
@@ -1019,6 +1625,8 @@ static bool
 choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 {
 	double		avg_custom_cost;
+
+	return false;
 
 	/* One-shot plans will always be considered custom */
 	if (plansource->is_oneshot)
@@ -1163,6 +1771,21 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		if (CheckCachedPlan(plansource))
 		{
 			/* We want a generic plan, and we already have a valid one */
+
+			if (plansource->num_main_execution >= 5) {
+				double main_cost = get_mean_cost(plansource, true);
+				double backup_cost = get_mean_cost(plansource, false);
+				// printf("plancache.c: Main cost: %f, backup cost: %f\n", main_cost, backup_cost);
+				if (backup_cost != (double)-1 && main_cost > backup_cost) {
+					// printf("Switch!\n");
+					ListCell* lc;
+					foreach (lc, plansource->gplan->stmt_list) {
+						PlannedStmt* stmt = lfirst_node(PlannedStmt, lc);
+						switch_plan_tree(stmt, plansource);
+					}
+				}
+			}
+
 			plan = plansource->gplan;
 			Assert(plan->magic == CACHEDPLAN_MAGIC);
 		}
@@ -1946,14 +2569,147 @@ PlanCacheComputeResultDesc(List *stmt_list)
 static void
 PlanCacheRelCallback(Datum arg, Oid relid)
 {
+	// printf("plancache.c: PlanCacheRelCallback() begin, %d\n", (int)relid);
+	AdaptiveIndexMsg *msg = (AdaptiveIndexMsg *)arg;
+	// printf("plancache.c: PlanCacheRelCallback() begin, index op %d %d\n", (int)msg->indexop, (int)msg->indexoid);
 	dlist_iter	iter;
+	IndexOptInfo *info = NULL;
+	RelOptInfo *relinfo = NULL;
+	Relation myindex = NULL;
+	Oid indexoid = msg->indexoid;
+	int8 indexop = msg->indexop;
+
 
 	dlist_foreach(iter, &saved_plan_list)
 	{
 		CachedPlanSource *plansource = dlist_container(CachedPlanSource,
 													   node, iter.cur);
-
+		ListCell *lc;
+		
 		Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
+
+		if (plansource->gplan && plansource->gplan->is_valid && list_member_oid(plansource->relationOids, relid)) {
+			TimestampTz begin = GetCurrentTimestamp();
+			// initialize indexoptinfo if first time.
+			if (indexop == INVAL_ARGV_INDEX_CREATE && info == NULL) {
+				myindex = index_open(indexoid, NoLock);
+
+				info = makeNode(IndexOptInfo);
+				relinfo = makeNode(RelOptInfo);
+
+				info->indexoid = indexoid;
+				info->rel = relinfo;
+				info->ncolumns = myindex->rd_index->indnatts;
+				info->nkeycolumns = myindex->rd_index->indnkeyatts;
+				// printf("Index Col Number %d\n", info->ncolumns);
+				info->indexkeys = (int *) palloc(sizeof(int) * info->ncolumns);
+				info->indexcollations = (Oid *) palloc(sizeof(Oid) * info->nkeycolumns);
+				info->opfamily = (Oid *) palloc(sizeof(Oid) * info->nkeycolumns);
+				info->relam = myindex->rd_rel->relam;
+				info->amsearchnulls = myindex->rd_indam->amsearchnulls;
+
+				int i = 0;
+				for (i = 0; i < info->ncolumns; i++)
+				{
+					info->indexkeys[i] = myindex->rd_index->indkey.values[i];
+					// printf("Index Col %d Mapping %d\n", i, info->indexkeys[i]);
+				}
+				for (i = 0; i < info->nkeycolumns; i++)
+				{
+					info->opfamily[i] = myindex->rd_opfamily[i];
+					info->indexcollations[i] = myindex->rd_indcollation[i];
+				}
+
+				// printf("plancache.c: Getting index expressions\n");
+				info->indexprs = RelationGetIndexExpressions(myindex);
+				if (info->indexprs && relid != 1)
+					ChangeVarNodes((Node *) info->indexprs, 1, relid, 0);
+			}
+
+			bool changeHappen = false;
+			MemoryContext oldCxt = MemoryContextSwitchTo(plansource->context);
+
+			if (indexop == INVAL_ARGV_INDEX_CREATE) {
+				// printf("plancache.c: Got index expressions\n");
+
+				foreach(lc, plansource->gplan->stmt_list) {
+					PlannedStmt *plan = lfirst_node(PlannedStmt, lc);
+					if (!list_member_oid(plan->relationOids, relid)) {
+						continue;
+					}
+					List *params = NIL;
+					params = lappend(params, info);
+					params = lappend_oid(params, relid);
+					params = lappend(params, plan->relationOids);
+					// TODO:
+					// If plan has_index: continue
+					// Else: do creation
+
+					// TODO: For callback: Set plan.has_index if create a new plan
+					if (plan->has_index) {
+						// printf("Already has index. Do not add plan\n");
+						continue;
+					}
+						
+					plan->planTree = PreOrderPlantreeTraverse(plan->planTree, create_index_sort_replacement, params, plan);
+					if (!plan->has_index) {
+						plan->planTree = PreOrderPlantreeTraverse(plan->planTree, create_index_trigger, params, plan);
+					}
+					
+					
+					// Check whether plan.has_index is set to true
+					// If yes, update state to 1. Switch running time and set main to 0. 
+					if (plan->has_index) {
+						// TODO: update state to 1. Switch running time and set main to 0. 
+						plan->state = 1;
+						switch_running_time(plansource);
+						set_running_cost(plansource, true);
+						changeHappen = true;
+					}
+				}
+			} else if (indexop == INVAL_ARGV_INDEX_DROP) {
+				foreach(lc, plansource->gplan->stmt_list) {
+					PlannedStmt *plan = lfirst_node(PlannedStmt, lc);
+					if (!list_member_oid(plan->relationOids, relid)) {
+						continue;
+					}
+					List *params = NIL;
+					params = lappend_oid(params, indexoid);
+
+					// If !has_index: continue
+					if (!plan->has_index) {
+						continue;
+					}
+
+					if (plan->state == 0) {
+						switch_plan_tree(plan, plansource);
+					}
+
+					// postorder delete
+					plan->planTree = PostOrderPlantreeTraverse(plan->planTree, drop_index_trigger, params, plan);
+					// Set has_index to false
+					// If state == 1: switch running time
+					// Set backup running time to -1
+					if (!plan->has_index) {
+						// If state == 1: switch running time
+						// TODO: Set backup running time to -1
+						plan->state = 0;
+						set_running_cost(plansource, false);
+						changeHappen = true;
+					}
+				}
+			}
+			if (changeHappen) {
+				TimestampTz end = GetCurrentTimestamp();
+				printf("%s:Substitution:%ld:%ld\n", plansource->stmt_name, (end - begin), begin);
+			}
+
+			MemoryContextSwitchTo(oldCxt);
+		}
+
+		/* Do not need to further invalidate if is adaptive to index. */
+		if (indexop != INVAL_ARGV_INDEX_NOOP)
+			continue;
 
 		/* No work if it's already invalidated */
 		if (!plansource->is_valid)
@@ -1970,6 +2726,7 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 			list_member_oid(plansource->relationOids, relid))
 		{
 			/* Invalidate the querytree and generic plan */
+			// printf("plancache.c: Invalidate something\n");
 			plansource->is_valid = false;
 			if (plansource->gplan)
 				plansource->gplan->is_valid = false;
@@ -1993,11 +2750,21 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 					list_member_oid(plannedstmt->relationOids, relid))
 				{
 					/* Invalidate the generic plan only */
+					// printf("plancache.c: Invalidate something\n");
 					plansource->gplan->is_valid = false;
 					break;		/* out of stmt_list scan */
 				}
 			}
 		}
+	}
+
+	if (info != NULL) {
+		index_close(myindex, NoLock);
+		pfree(relinfo);
+		pfree(info->indexkeys);
+		pfree(info->indexcollations);
+		pfree(info->opfamily);
+		pfree(info);
 	}
 
 	/* Likewise check cached expressions */
@@ -2015,9 +2782,11 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 		if ((relid == InvalidOid) ? cexpr->relationOids != NIL :
 			list_member_oid(cexpr->relationOids, relid))
 		{
+			// printf("plancache.c: Invalidate something\n");
 			cexpr->is_valid = false;
 		}
 	}
+	// printf("plancache.c: PlanCacheRelCallback() end\n");
 }
 
 /*
@@ -2030,7 +2799,9 @@ PlanCacheRelCallback(Datum arg, Oid relid)
 static void
 PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
 {
+	// printf("plancache.c: PlanCacheObjectCallback() begin\n");
 	dlist_iter	iter;
+	return;
 
 	dlist_foreach(iter, &saved_plan_list)
 	{
@@ -2061,6 +2832,7 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
 				item->hashValue == hashvalue)
 			{
 				/* Invalidate the querytree and generic plan */
+				// printf("plancache.c: Invalidate something\n");
 				plansource->is_valid = false;
 				if (plansource->gplan)
 					plansource->gplan->is_valid = false;
@@ -2091,6 +2863,7 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
 						item->hashValue == hashvalue)
 					{
 						/* Invalidate the generic plan only */
+						// printf("plancache.c: Invalidate something\n");
 						plansource->gplan->is_valid = false;
 						break;	/* out of invalItems scan */
 					}
@@ -2123,11 +2896,13 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
 			if (hashvalue == 0 ||
 				item->hashValue == hashvalue)
 			{
+				// printf("plancache.c: Invalidate something\n");
 				cexpr->is_valid = false;
 				break;
 			}
 		}
 	}
+	// printf("plancache.c: PlanCacheObjectCallback() end\n");
 }
 
 /*
@@ -2139,7 +2914,9 @@ PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue)
 static void
 PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue)
 {
+	// printf("plancache.c: PlanCacheSysCallback() begin\n");
 	ResetPlanCache();
+	// printf("plancache.c: PlanCacheSysCallback() end\n");
 }
 
 /*
@@ -2148,6 +2925,7 @@ PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue)
 void
 ResetPlanCache(void)
 {
+	// printf("plancache.c: ResetPlanCache() begin\n");
 	dlist_iter	iter;
 
 	dlist_foreach(iter, &saved_plan_list)
@@ -2185,6 +2963,7 @@ ResetPlanCache(void)
 				UtilityContainsQuery(query->utilityStmt))
 			{
 				/* non-utility statement, so invalidate */
+				// printf("plancache.c: Invalidate something\n");
 				plansource->is_valid = false;
 				if (plansource->gplan)
 					plansource->gplan->is_valid = false;
@@ -2204,4 +2983,176 @@ ResetPlanCache(void)
 
 		cexpr->is_valid = false;
 	}
+	// printf("plancache.c: ResetPlanCache() end\n");
+}
+
+
+static SeqScan *
+make_seqscan(List *qptlist,
+			 List *qpqual,
+			 Index scanrelid)
+{
+	SeqScan    *node = makeNode(SeqScan);
+	Plan	   *plan = &node->plan;
+
+	plan->targetlist = qptlist;
+	plan->qual = qpqual;
+	plan->lefttree = NULL;
+	plan->righttree = NULL;
+	node->scanrelid = scanrelid;
+
+	return node;
+}
+
+static SampleScan *
+make_samplescan(List *qptlist,
+				List *qpqual,
+				Index scanrelid,
+				TableSampleClause *tsc)
+{
+	SampleScan *node = makeNode(SampleScan);
+	Plan	   *plan = &node->scan.plan;
+
+	plan->targetlist = qptlist;
+	plan->qual = qpqual;
+	plan->lefttree = NULL;
+	plan->righttree = NULL;
+	node->scan.scanrelid = scanrelid;
+	node->tablesample = tsc;
+
+	return node;
+}
+
+static IndexScan *
+make_indexscan(List *qptlist,
+			   List *qpqual,
+			   Index scanrelid,
+			   Oid indexid,
+			   List *indexqual,
+			   List *indexqualorig,
+			   List *indexorderby,
+			   List *indexorderbyorig,
+			   List *indexorderbyops,
+			   ScanDirection indexscandir)
+{
+	IndexScan  *node = makeNode(IndexScan);
+	Plan	   *plan = &node->scan.plan;
+
+	plan->targetlist = qptlist;
+	plan->qual = qpqual;
+	plan->lefttree = NULL;
+	plan->righttree = NULL;
+	node->scan.scanrelid = scanrelid;
+	node->indexid = indexid;
+	node->indexqual = indexqual;
+	node->indexqualorig = indexqualorig;
+	node->indexorderby = indexorderby;
+	node->indexorderbyorig = indexorderbyorig;
+	node->indexorderbyops = indexorderbyops;
+	node->indexorderdir = indexscandir;
+
+	return node;
+}
+
+static IndexOnlyScan *
+make_indexonlyscan(List *qptlist,
+				   List *qpqual,
+				   Index scanrelid,
+				   Oid indexid,
+				   List *indexqual,
+				   List *recheckqual,
+				   List *indexorderby,
+				   List *indextlist,
+				   ScanDirection indexscandir)
+{
+	IndexOnlyScan *node = makeNode(IndexOnlyScan);
+	Plan	   *plan = &node->scan.plan;
+
+	plan->targetlist = qptlist;
+	plan->qual = qpqual;
+	plan->lefttree = NULL;
+	plan->righttree = NULL;
+	node->scan.scanrelid = scanrelid;
+	node->indexid = indexid;
+	node->indexqual = indexqual;
+	node->recheckqual = recheckqual;
+	node->indexorderby = indexorderby;
+	node->indextlist = indextlist;
+	node->indexorderdir = indexscandir;
+
+	return node;
+}
+
+static Plan* switch_tree_internal(Plan* plan) {
+	if (plan == NULL) {
+		return NULL;
+	}
+
+	if (plan->backupNode != NULL) {
+		plan->backupNode->backupNode = plan;
+		plan = plan->backupNode;
+	}
+
+	plan->lefttree = switch_tree_internal(plan->lefttree);
+	plan->righttree = switch_tree_internal(plan->righttree);
+	// printf("Node type is: %d\n", nodeTag(plan));
+	return plan;
+}
+
+static void switch_running_time(CachedPlanSource *plansource) {
+	double tmp_cost = plansource->total_main_cost;
+	plansource->total_main_cost = plansource->total_backup_cost;
+	plansource->total_backup_cost = tmp_cost;
+
+	int64 tmp_num = plansource->num_main_execution;
+	plansource->num_backup_execution = plansource->num_main_execution;
+	plansource->num_main_execution = tmp_num;
+}
+
+static double get_mean_cost(CachedPlanSource *plansource, bool isMain) {
+	double result = 0.0;
+
+	if (!isMain && plansource->num_backup_execution == 0) {
+		return (double)-1;
+	}
+
+	if (isMain) {
+		if (plansource->num_main_execution != 0) {
+			result = plansource->total_main_cost / (double)plansource->num_main_execution;
+		}
+	} else {
+		result = plansource->total_backup_cost / (double)plansource->num_backup_execution;
+	}
+
+	return result;
+}
+
+static void set_running_cost(CachedPlanSource *plansource, bool isMain) {
+	if (isMain) {
+		plansource->total_main_cost = 0.0;
+		plansource->num_main_execution = 0;
+	} else {
+		plansource->total_backup_cost = 0.0;
+		plansource->num_backup_execution = 0;
+	}
+}
+
+static void switch_plan_tree(PlannedStmt* stmt, CachedPlanSource *plansource) {
+	// switch():
+	//   pre-traversal. Swap (two assignments) current node and backup node if backup node is not NULL
+	//   switch running mean
+	//   Update state
+	TimestampTz begin = GetCurrentTimestamp();
+	if (!stmt->has_index) {
+		return;
+	}
+	
+	switch_running_time(plansource);
+
+	stmt->planTree = switch_tree_internal(stmt->planTree);
+
+	stmt->state = (stmt->state + 1) % 2;
+
+	TimestampTz end = GetCurrentTimestamp();
+	printf("%s:Switching:%ld:%ld\n", plansource->stmt_name, end - begin, begin);
 }

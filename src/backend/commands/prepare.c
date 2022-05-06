@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <stdio.h>
 
 #include "access/xact.h"
 #include "catalog/pg_type.h"
@@ -90,7 +91,11 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	 */
 	plansource = CreateCachedPlan(rawstmt, pstate->p_sourcetext,
 								  CreateCommandTag(stmt->query));
-
+	MemoryContext old = MemoryContextSwitchTo(plansource->context);
+	plansource->stmt_name = palloc0(strlen(stmt->name) + 1);
+	strncpy(plansource->stmt_name, stmt->name, sizeof(stmt->name));
+	plansource->stmt_name[strlen(stmt->name)] = '\0';
+	MemoryContextSwitchTo(old);
 	/* Transform list of TypeNames to array of type OIDs */
 	nargs = list_length(stmt->argtypes);
 
@@ -288,9 +293,10 @@ ExecuteQuery(ParseState *pstate,
 	 * Run the portal as appropriate.
 	 */
 	PortalStart(portal, paramLI, eflags, GetActiveSnapshot());
-
+	TimestampTz start = GetCurrentTimestamp();
 	(void) PortalRun(portal, count, false, true, dest, dest, qc);
-
+	TimestampTz end = GetCurrentTimestamp();
+	printf("%s:Execution:%ld:%ld\n", stmt->name, (end - start), start);
 	PortalDrop(portal, false);
 
 	if (estate)
